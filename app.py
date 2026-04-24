@@ -11,7 +11,8 @@ app = Flask(__name__)
 
 API_KEY = os.environ.get("BINANCE_API_KEY")
 API_SECRET = os.environ.get("BINANCE_API_SECRET")
-WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "mi_clave_secreta")
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET")
+RISK_PERCENT = float(os.environ.get("RISK_PERCENT", "10"))
 
 client = Client(API_KEY, API_SECRET)
 client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
@@ -34,20 +35,29 @@ def webhook():
 
         symbol   = data.get("symbol", "BTCUSDT")
         side     = data.get("side", "BUY").upper()
-        quantity = float(data.get("quantity", 0.001))
         sl_pct   = float(data.get("sl_pct", 1.5))
-        tp_pct   = float(data.get("tp_pct", 3.0))
+        tp_pct   = float(data.get("tp_pct", 4.5))
 
-        order = client.futures_create_order(
-            symbol=symbol,
-            side=SIDE_BUY if side == "BUY" else SIDE_SELL,
-            type=ORDER_TYPE_MARKET,
-            quantity=quantity
-        )
+        # Obtener balance disponible en USDT
+        account = client.futures_account()
+        balance = float(next(
+            asset["availableBalance"]
+            for asset in account["assets"]
+            if asset["asset"] == "USDT"
+        ))
 
+        # Obtener precio actual
         mark = client.futures_mark_price(symbol=symbol)
         entry_price = float(mark["markPrice"])
 
+        # Calcular quantity en base al riesgo
+        risk_amount = balance * (RISK_PERCENT / 100)
+        quantity = round(risk_amount / (entry_price * sl_pct / 100), 3)
+
+        # Asegurar mínimo de Binance
+        quantity = max(quantity, 0.001)
+
+        # Calcular SL y TP
         if side == "BUY":
             sl_price = round(entry_price * (1 - sl_pct / 100), 2)
             tp_price = round(entry_price * (1 + tp_pct / 100), 2)
@@ -59,6 +69,15 @@ def webhook():
             sl_side  = SIDE_BUY
             tp_side  = SIDE_BUY
 
+        # Ejecutar orden
+        order = client.futures_create_order(
+            symbol=symbol,
+            side=SIDE_BUY if side == "BUY" else SIDE_SELL,
+            type=ORDER_TYPE_MARKET,
+            quantity=quantity
+        )
+
+        # Stop Loss
         client.futures_create_order(
             symbol=symbol,
             side=sl_side,
@@ -67,6 +86,7 @@ def webhook():
             closePosition=True
         )
 
+        # Take Profit
         client.futures_create_order(
             symbol=symbol,
             side=tp_side,
@@ -75,11 +95,13 @@ def webhook():
             closePosition=True
         )
 
-        print(f"Orden: {side} {quantity} {symbol} | SL: {sl_price} | TP: {tp_price}")
+        print(f"Orden: {side} {quantity} {symbol} | Balance: {balance} | SL: {sl_price} | TP: {tp_price}")
 
         return jsonify({
             "status": "ok",
             "order_id": order["orderId"],
+            "quantity": quantity,
+            "balance_usdt": balance,
             "sl": sl_price,
             "tp": tp_price
         }), 200
