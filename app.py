@@ -10,6 +10,7 @@ from flask import Flask, request, jsonify
 from binance.client import Client
 from binance.enums import *
 from dotenv import load_dotenv
+from sheets_logger import setup_headers, log_trade_entry, log_trade_exit, update_bot_state
 
 load_dotenv()
 
@@ -20,18 +21,34 @@ API_SECRET     = os.environ.get("BINANCE_API_SECRET")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET")
 RISK_PERCENT   = float(os.environ.get("RISK_PERCENT", "10"))
 WEBHOOK_URL    = os.environ.get("WEBHOOK_URL", "http://127.0.0.1:5000/webhook")
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+TELEGRAM_CHAT  = os.environ.get("TELEGRAM_CHAT_ID")
 
 client = Client(API_KEY, API_SECRET)
 client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
 
+# ─── Telegram ──────────────────────────────────────────────────────────────────
+
+def send_telegram(msg):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT:
+        return
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        requests.post(url, json={
+            "chat_id": TELEGRAM_CHAT,
+            "text"   : msg,
+            "parse_mode": "HTML"
+        }, timeout=10)
+    except Exception as e:
+        print(f"❌ Error Telegram: {e}")
+
 # ─── Estado global por símbolo ─────────────────────────────────────────────────
-# Replica las variables `var` del Pine Script
+
 state = {}
 
 def get_state(symbol):
     if symbol not in state:
         state[symbol] = {
-            # HTF
             "htf_bos_dir"          : 0,
             "htf_bos_valid"        : False,
             "htf_bos_level"        : None,
@@ -52,7 +69,6 @@ def get_state(symbol):
             "confirmed_ll"         : None,
             "last_bull_bos_level"  : None,
             "last_bear_bos_level"  : None,
-            # LTF
             "ltf_state"            : 0,
             "ltf_internal_high"    : None,
             "ltf_internal_low"     : None,
@@ -69,6 +85,8 @@ def get_state(symbol):
             "ltf_stop_loss"        : None,
             "ltf_take_profit"      : None,
             "ltf_reentry_count"    : 0,
+            "ltf_quantity"         : None,
+            "ltf_balance"          : None,
             "trade_state"          : "Neutral",
         }
     return state[symbol]
@@ -76,7 +94,6 @@ def get_state(symbol):
 # ─── Utilidades de datos ───────────────────────────────────────────────────────
 
 def get_klines(symbol, interval, limit=200):
-    """Trae velas y las devuelve como DataFrame"""
     raw = client.futures_klines(symbol=symbol, interval=interval, limit=limit)
     df  = pd.DataFrame(raw, columns=[
         "time","open","high","low","close","volume",
@@ -88,10 +105,6 @@ def get_klines(symbol, interval, limit=200):
     return df
 
 def pivot_high(highs, left, right):
-    """
-    Equivalente a ta.pivothigh(high, left, right) de Pine.
-    Retorna array donde hay valor solo en pivots confirmados.
-    """
     n   = len(highs)
     res = [None] * n
     for i in range(left, n - right):
@@ -102,7 +115,6 @@ def pivot_high(highs, left, right):
     return res
 
 def pivot_low(lows, left, right):
-    """Equivalente a ta.pivotlow(low, left, right) de Pine"""
     n   = len(lows)
     res = [None] * n
     for i in range(left, n - right):
@@ -113,14 +125,12 @@ def pivot_low(lows, left, right):
     return res
 
 def last_val(arr):
-    """Último valor no None de un array"""
     for v in reversed(arr):
         if v is not None:
             return v
     return None
 
 def prev_val(arr):
-    """Penúltimo valor no None de un array"""
     count = 0
     for v in reversed(arr):
         if v is not None:
@@ -130,15 +140,8 @@ def prev_val(arr):
     return None
 
 def find_htf_ob(opens, highs, lows, closes, direction, lookback=6):
-    """
-    Replica la lógica del HTF OB del Pine Script.
-    Busca las últimas 3 velas consecutivas en dirección opuesta al BOS.
-    direction=1 → BOS alcista → busca 3 velas bajistas (bullish OB)
-    direction=-1 → BOS bajista → busca 3 velas alcistas (bearish OB)
-    """
     for start in range(0, lookback - 2):
         if direction == 1:
-            # Busca 3 velas bajistas consecutivas
             if (closes[-(start+1)] < opens[-(start+1)] and
                 closes[-(start+2)] < opens[-(start+2)] and
                 closes[-(start+3)] < opens[-(start+3)]):
@@ -146,7 +149,6 @@ def find_htf_ob(opens, highs, lows, closes, direction, lookback=6):
                 ob_low  = min(lows[-(start+1)],  lows[-(start+2)],  lows[-(start+3)])
                 return ob_high, ob_low
         else:
-            # Busca 3 velas alcistas consecutivas
             if (closes[-(start+1)] > opens[-(start+1)] and
                 closes[-(start+2)] > opens[-(start+2)] and
                 closes[-(start+3)] > opens[-(start+3)]):
@@ -158,13 +160,8 @@ def find_htf_ob(opens, highs, lows, closes, direction, lookback=6):
 # ─── Motor HTF ─────────────────────────────────────────────────────────────────
 
 def process_htf(symbol, htf_interval="1h", swing_len=5):
-    """
-    Replica el módulo HTF Structure del indicador V3.
-    Detecta BOS, construye el canal y gestiona el estado.
-    """
-    s   = get_state(symbol)
-    df  = get_klines(symbol, htf_interval, limit=150)
-    
+    s      = get_state(symbol)
+    df     = get_klines(symbol, htf_interval, limit=150)
     opens  = df["open"].tolist()
     highs  = df["high"].tolist()
     lows   = df["low"].tolist()
@@ -173,15 +170,12 @@ def process_htf(symbol, htf_interval="1h", swing_len=5):
     ph = pivot_high(highs, swing_len, swing_len)
     pl = pivot_low(lows,   swing_len, swing_len)
 
-    # Tracking de HH, HL, LL, LH (igual que Pine)
     last_high = last_val(ph)
     prev_high = prev_val(ph)
     last_low  = last_val(pl)
     prev_low  = prev_val(pl)
 
-    if last_high is None or prev_high is None:
-        return
-    if last_low is None or prev_low is None:
+    if None in [last_high, prev_high, last_low, prev_low]:
         return
 
     last_hh = last_high if last_high > prev_high else None
@@ -191,124 +185,103 @@ def process_htf(symbol, htf_interval="1h", swing_len=5):
 
     current_close = closes[-1]
 
-    # Detectar OB en HTF
-    ob_high, ob_low = find_htf_ob(opens, highs, lows, closes, 1)
-    bull_ob_valid   = ob_high is not None
-
+    ob_high,   ob_low   = find_htf_ob(opens, highs, lows, closes,  1)
     ob_high_b, ob_low_b = find_htf_ob(opens, highs, lows, closes, -1)
-    bear_ob_valid        = ob_high_b is not None
+    bull_ob_valid = ob_high   is not None
+    bear_ob_valid = ob_high_b is not None
 
-    # BOS alcista: cierre sobre último HH con OB válido
-    bull_bos = (last_hh is not None and
-                current_close > last_hh and
-                bull_ob_valid and
+    bull_bos = (last_hh is not None and current_close > last_hh and bull_ob_valid and
                 (s["last_bull_bos_level"] is None or last_hh != s["last_bull_bos_level"]))
-
-    # BOS bajista: cierre bajo último LL con OB válido
-    bear_bos = (last_ll is not None and
-                current_close < last_ll and
-                bear_ob_valid and
+    bear_bos = (last_ll is not None and current_close < last_ll and bear_ob_valid and
                 (s["last_bear_bos_level"] is None or last_ll != s["last_bear_bos_level"]))
 
-    # Invalidación del BOS activo
     if s["htf_bos_valid"]:
-        if s["htf_bos_dir"] == 1 and s["htf_ref_hl"] and current_close < s["htf_ref_hl"]:
+        if s["htf_bos_dir"] == 1  and s["htf_ref_hl"] and current_close < s["htf_ref_hl"]:
             _reset_htf_state(s, "HTF Invalidated (Below HL)")
         if s["htf_bos_dir"] == -1 and s["htf_ref_lh"] and current_close > s["htf_ref_lh"]:
             _reset_htf_state(s, "HTF Invalidated (Above LH)")
-        if s["htf_bos_dir"] == 1 and bear_bos:
+        if s["htf_bos_dir"] == 1  and bear_bos:
             _reset_htf_state(s, "HTF Invalidated (Opposing BOS)")
         if s["htf_bos_dir"] == -1 and bull_bos:
             _reset_htf_state(s, "HTF Invalidated (Opposing BOS)")
 
-    # Nuevo BOS alcista
     if bull_bos and not (s["htf_bos_dir"] == 1 and s["htf_bos_valid"]):
-        s["htf_bos_dir"]         = 1
-        s["htf_bos_level"]       = last_hh
-        s["htf_bos_valid"]       = True
-        s["htf_ref_hl"]          = last_hl
-        s["waiting_hl"]          = True
-        s["waiting_lh"]          = False
-        s["waiting_hh_confirm"]  = False
-        s["confirmed_hh"]        = last_hh
-        s["htf_ob_high"]         = ob_high
-        s["htf_ob_low"]          = ob_low
-        s["last_bull_bos_level"] = last_hh
-        s["htf_channel_active"]  = False
-        s["htf_channel_built"]   = False
+        s.update({
+            "htf_bos_dir": 1, "htf_bos_level": last_hh, "htf_bos_valid": True,
+            "htf_ref_hl": last_hl, "waiting_hl": True, "waiting_lh": False,
+            "waiting_hh_confirm": False, "confirmed_hh": last_hh,
+            "htf_ob_high": ob_high, "htf_ob_low": ob_low,
+            "last_bull_bos_level": last_hh,
+            "htf_channel_active": False, "htf_channel_built": False,
+            "trade_state": "Bullish BOS — Waiting for HL"
+        })
         _reset_ltf_state(s)
-        s["trade_state"] = "Bullish BOS — Waiting for HL"
-        print(f"  📈 BULLISH BOS detectado | Nivel: {last_hh:.2f}")
+        print(f"  📈 BULLISH BOS | {last_hh:.2f}")
+        send_telegram(f"📈 <b>BULLISH BOS</b> — {symbol}\nNivel: {last_hh:.2f}\nEsperando HL...")
 
-    # Nuevo BOS bajista
     if bear_bos and not (s["htf_bos_dir"] == -1 and s["htf_bos_valid"]):
-        s["htf_bos_dir"]         = -1
-        s["htf_bos_level"]       = last_ll
-        s["htf_bos_valid"]       = True
-        s["htf_ref_lh"]          = last_lh
-        s["waiting_lh"]          = True
-        s["waiting_hl"]          = False
-        s["waiting_ll_confirm"]  = False
-        s["confirmed_ll"]        = last_ll
-        s["htf_ob_high"]         = ob_high_b
-        s["htf_ob_low"]          = ob_low_b
-        s["last_bear_bos_level"] = last_ll
-        s["htf_channel_active"]  = False
-        s["htf_channel_built"]   = False
+        s.update({
+            "htf_bos_dir": -1, "htf_bos_level": last_ll, "htf_bos_valid": True,
+            "htf_ref_lh": last_lh, "waiting_lh": True, "waiting_hl": False,
+            "waiting_ll_confirm": False, "confirmed_ll": last_ll,
+            "htf_ob_high": ob_high_b, "htf_ob_low": ob_low_b,
+            "last_bear_bos_level": last_ll,
+            "htf_channel_active": False, "htf_channel_built": False,
+            "trade_state": "Bearish BOS — Waiting for LH"
+        })
         _reset_ltf_state(s)
-        s["trade_state"] = "Bearish BOS — Waiting for LH"
-        print(f"  📉 BEARISH BOS detectado | Nivel: {last_ll:.2f}")
+        print(f"  📉 BEARISH BOS | {last_ll:.2f}")
+        send_telegram(f"📉 <b>BEARISH BOS</b> — {symbol}\nNivel: {last_ll:.2f}\nEsperando LH...")
 
-    # Esperar HL después de BOS alcista
     if s["waiting_hl"] and s["htf_bos_dir"] == 1 and last_hl is not None:
-        s["waiting_hl"]         = False
+        s["waiting_hl"] = False
         s["waiting_hh_confirm"] = True
-        s["htf_ref_hl"]         = last_hl
-        s["trade_state"]        = "HL Formed — Waiting for HH"
+        s["htf_ref_hl"] = last_hl
+        s["trade_state"] = "HL Formed — Waiting for HH"
 
-    # Confirmar HH → construir canal
     if s["waiting_hh_confirm"] and s["htf_bos_dir"] == 1:
         if last_hh is not None and s["confirmed_hh"] and last_hh > s["confirmed_hh"]:
-            s["waiting_hh_confirm"]  = False
-            s["htf_channel_bot"]     = s["htf_ob_low"]
-            s["htf_channel_top"]     = last_hh
-            s["htf_channel_mid"]     = s["htf_channel_bot"] + (s["htf_channel_top"] - s["htf_channel_bot"]) * 0.5
-            s["htf_channel_built"]   = True
-            s["htf_channel_active"]  = False
+            s["waiting_hh_confirm"] = False
+            s["htf_channel_bot"]    = s["htf_ob_low"]
+            s["htf_channel_top"]    = last_hh
+            s["htf_channel_mid"]    = s["htf_channel_bot"] + (s["htf_channel_top"] - s["htf_channel_bot"]) * 0.5
+            s["htf_channel_built"]  = True
+            s["htf_channel_active"] = False
+            s["trade_state"]        = "Channel Built — Waiting for 50% Retrace"
             _reset_ltf_state(s)
-            s["trade_state"] = "Channel Built — Waiting for 50% Retrace"
-            print(f"  🔲 Canal alcista construido | Bot: {s['htf_channel_bot']:.2f} | 50%: {s['htf_channel_mid']:.2f} | Top: {s['htf_channel_top']:.2f}")
+            print(f"  🔲 Canal alcista | Bot: {s['htf_channel_bot']:.2f} | 50%: {s['htf_channel_mid']:.2f} | Top: {s['htf_channel_top']:.2f}")
+            send_telegram(f"🔲 <b>Canal alcista construido</b> — {symbol}\n▲ Top: {s['htf_channel_top']:.2f}\n◈ 50%: {s['htf_channel_mid']:.2f}\n▼ Bot: {s['htf_channel_bot']:.2f}")
 
-    # Esperar LH después de BOS bajista
     if s["waiting_lh"] and s["htf_bos_dir"] == -1 and last_lh is not None:
-        s["waiting_lh"]         = False
+        s["waiting_lh"] = False
         s["waiting_ll_confirm"] = True
-        s["htf_ref_lh"]         = last_lh
-        s["trade_state"]        = "LH Formed — Waiting for LL"
+        s["htf_ref_lh"] = last_lh
+        s["trade_state"] = "LH Formed — Waiting for LL"
 
-    # Confirmar LL → construir canal
     if s["waiting_ll_confirm"] and s["htf_bos_dir"] == -1:
         if last_ll is not None and s["confirmed_ll"] and last_ll < s["confirmed_ll"]:
-            s["waiting_ll_confirm"]  = False
-            s["htf_channel_top"]     = s["htf_ob_high"]
-            s["htf_channel_bot"]     = last_ll
-            s["htf_channel_mid"]     = s["htf_channel_bot"] + (s["htf_channel_top"] - s["htf_channel_bot"]) * 0.5
-            s["htf_channel_built"]   = True
-            s["htf_channel_active"]  = False
+            s["waiting_ll_confirm"] = False
+            s["htf_channel_top"]    = s["htf_ob_high"]
+            s["htf_channel_bot"]    = last_ll
+            s["htf_channel_mid"]    = s["htf_channel_bot"] + (s["htf_channel_top"] - s["htf_channel_bot"]) * 0.5
+            s["htf_channel_built"]  = True
+            s["htf_channel_active"] = False
+            s["trade_state"]        = "Channel Built — Waiting for 50% Retrace"
             _reset_ltf_state(s)
-            s["trade_state"] = "Channel Built — Waiting for 50% Retrace"
-            print(f"  🔲 Canal bajista construido | Bot: {s['htf_channel_bot']:.2f} | 50%: {s['htf_channel_mid']:.2f} | Top: {s['htf_channel_top']:.2f}")
+            print(f"  🔲 Canal bajista | Bot: {s['htf_channel_bot']:.2f} | 50%: {s['htf_channel_mid']:.2f} | Top: {s['htf_channel_top']:.2f}")
+            send_telegram(f"🔲 <b>Canal bajista construido</b> — {symbol}\n▲ Top: {s['htf_channel_top']:.2f}\n◈ 50%: {s['htf_channel_mid']:.2f}\n▼ Bot: {s['htf_channel_bot']:.2f}")
 
-    # Activar canal cuando precio llega al 50%
     if s["htf_channel_built"] and not s["htf_channel_active"] and s["htf_bos_valid"]:
         if s["htf_bos_dir"] == 1 and current_close <= s["htf_channel_mid"]:
             s["htf_channel_active"] = True
             s["trade_state"]        = "Channel Active — 50% Validated"
-            print(f"  ✅ Canal activo — precio en zona 50%: {current_close:.2f}")
+            print(f"  ✅ Canal activo — precio en 50%: {current_close:.2f}")
+            send_telegram(f"⬛ <b>Canal activo</b> — {symbol}\nPrecio en zona 50%: {current_close:.2f}\nBuscando entrada LTF...")
         if s["htf_bos_dir"] == -1 and current_close >= s["htf_channel_mid"]:
             s["htf_channel_active"] = True
             s["trade_state"]        = "Channel Active — 50% Validated"
-            print(f"  ✅ Canal activo — precio en zona 50%: {current_close:.2f}")
+            print(f"  ✅ Canal activo — precio en 50%: {current_close:.2f}")
+            send_telegram(f"⬛ <b>Canal activo</b> — {symbol}\nPrecio en zona 50%: {current_close:.2f}\nBuscando entrada LTF...")
 
 def _reset_htf_state(s, msg):
     s["htf_bos_valid"]      = False
@@ -338,14 +311,12 @@ def _reset_ltf_state(s):
     s["ltf_entry_price"]   = None
     s["ltf_stop_loss"]     = None
     s["ltf_take_profit"]   = None
+    s["ltf_quantity"]      = None
+    s["ltf_balance"]       = None
 
 # ─── Motor LTF ─────────────────────────────────────────────────────────────────
 
 def process_ltf(symbol, ltf_interval="5m", swing_len=3, fifty_tolerance=5.0):
-    """
-    Replica el módulo LTF Execution del indicador V3.
-    Solo corre si el canal HTF está activo.
-    """
     s = get_state(symbol)
 
     if not s["htf_bos_valid"] or not s["htf_channel_active"]:
@@ -359,23 +330,19 @@ def process_ltf(symbol, ltf_interval="5m", swing_len=3, fifty_tolerance=5.0):
 
     channel_top = s["htf_channel_top"]
     channel_bot = s["htf_channel_bot"]
-    channel_mid = s["htf_channel_mid"]
     bos_dir     = s["htf_bos_dir"]
 
-    # Verificar si precio está en zona 50% con tolerancia
     channel_range = channel_top - channel_bot
     current_pos   = (closes[-1] - channel_bot) / channel_range * 100
     in_fifty      = (50 - fifty_tolerance) <= current_pos <= (50 + fifty_tolerance)
 
-    # Estado 0 → esperar zona 50%
     if s["ltf_state"] == 0:
         if in_fifty:
-            s["ltf_state"]  = 1
+            s["ltf_state"]   = 1
             s["trade_state"] = "In 50% Zone — Building LTF Structure"
-            print(f"    🎯 LTF: Precio en zona 50% ({current_pos:.1f}%)")
+            print(f"    🎯 LTF: en zona 50% ({current_pos:.1f}%)")
         return None
 
-    # Si sale de la zona 50%, resetear LTF
     if not in_fifty and s["ltf_state"] == 1:
         s["ltf_state"]         = 0
         s["ltf_internal_high"] = None
@@ -383,10 +350,8 @@ def process_ltf(symbol, ltf_interval="5m", swing_len=3, fifty_tolerance=5.0):
         s["trade_state"]       = "Outside 50% Zone — LTF Paused"
         return None
 
-    # Detectar pivots LTF
     ph = pivot_high(highs, swing_len, swing_len)
     pl = pivot_low(lows,   swing_len, swing_len)
-
     last_ph = last_val(ph)
     last_pl = last_val(pl)
 
@@ -395,32 +360,29 @@ def process_ltf(symbol, ltf_interval="5m", swing_len=3, fifty_tolerance=5.0):
     if last_pl:
         s["ltf_internal_low"]  = last_pl
 
-    # Estado 1 → detectar MSS en LTF
     if s["ltf_state"] == 1:
         if s["ltf_internal_high"] is None or s["ltf_internal_low"] is None:
             return None
 
-        # MSS alcista: 3 velas alcistas consecutivas que rompen internal high
         if bos_dir == 1 and s["ltf_internal_high"]:
-            c1   = closes[-3] > opens[-3]
-            c2   = closes[-2] > opens[-2]
-            c3   = closes[-1] > opens[-1]
+            c1 = closes[-3] > opens[-3]
+            c2 = closes[-2] > opens[-2]
+            c3 = closes[-1] > opens[-1]
             prog = closes[-2] > closes[-3] and closes[-1] > closes[-2]
             if c1 and c2 and c3 and prog and closes[-1] > s["ltf_internal_high"]:
-                s["ltf_state"]      = 2
-                s["ltf_mss_level"]  = s["ltf_internal_high"]
-                s["ltf_mss_high"]   = highs[-1]
-                s["ltf_mss_low"]    = s["ltf_internal_low"]
+                s["ltf_state"]       = 2
+                s["ltf_mss_level"]   = s["ltf_internal_high"]
+                s["ltf_mss_high"]    = highs[-1]
+                s["ltf_mss_low"]     = s["ltf_internal_low"]
                 s["ltf_fifty_level"] = s["ltf_mss_low"] + (s["ltf_mss_high"] - s["ltf_mss_low"]) * 0.5
-                s["ltf_fifty_hit"]  = False
-                s["trade_state"]    = "LTF MSS Bullish — Waiting for 50%"
-                print(f"    📈 LTF MSS Bullish | 50% en: {s['ltf_fifty_level']:.2f}")
+                s["ltf_fifty_hit"]   = False
+                s["trade_state"]     = "LTF MSS Bullish — Waiting for 50%"
+                print(f"    📈 LTF MSS Bullish | 50%: {s['ltf_fifty_level']:.2f}")
 
-        # MSS bajista
         if bos_dir == -1 and s["ltf_internal_low"]:
-            c1   = closes[-3] < opens[-3]
-            c2   = closes[-2] < opens[-2]
-            c3   = closes[-1] < opens[-1]
+            c1 = closes[-3] < opens[-3]
+            c2 = closes[-2] < opens[-2]
+            c3 = closes[-1] < opens[-1]
             prog = closes[-2] < closes[-3] and closes[-1] < closes[-2]
             if c1 and c2 and c3 and prog and closes[-1] < s["ltf_internal_low"]:
                 s["ltf_state"]       = 2
@@ -430,25 +392,22 @@ def process_ltf(symbol, ltf_interval="5m", swing_len=3, fifty_tolerance=5.0):
                 s["ltf_fifty_level"] = s["ltf_mss_low"] + (s["ltf_mss_high"] - s["ltf_mss_low"]) * 0.5
                 s["ltf_fifty_hit"]   = False
                 s["trade_state"]     = "LTF MSS Bearish — Waiting for 50%"
-                print(f"    📉 LTF MSS Bearish | 50% en: {s['ltf_fifty_level']:.2f}")
+                print(f"    📉 LTF MSS Bearish | 50%: {s['ltf_fifty_level']:.2f}")
 
-    # Estado 2 → esperar retroceso al 50% del MSS
     if s["ltf_state"] == 2 and not s["ltf_fifty_hit"] and s["ltf_fifty_level"]:
         if bos_dir == 1 and lows[-1] <= s["ltf_fifty_level"]:
             s["ltf_fifty_hit"] = True
             s["ltf_state"]     = 3
             s["trade_state"]   = "LTF 50% Hit — Tracking OB"
-            print(f"    ✅ LTF 50% alcanzado — buscando OB")
+            print(f"    ✅ LTF 50% alcanzado")
         if bos_dir == -1 and highs[-1] >= s["ltf_fifty_level"]:
             s["ltf_fifty_hit"] = True
             s["ltf_state"]     = 3
             s["trade_state"]   = "LTF 50% Hit — Tracking OB"
-            print(f"    ✅ LTF 50% alcanzado — buscando OB")
+            print(f"    ✅ LTF 50% alcanzado")
 
-    # Estado 3 → identificar OB en LTF
     if s["ltf_state"] == 3 and s["ltf_fifty_hit"]:
         if bos_dir == 1:
-            # Vela bajista seguida de alcista → bullish OB
             if closes[-1] < opens[-1]:
                 s["ltf_ob_high"] = highs[-1]
                 s["ltf_ob_low"]  = lows[-1]
@@ -457,9 +416,9 @@ def process_ltf(symbol, ltf_interval="5m", swing_len=3, fifty_tolerance=5.0):
                 s["ltf_state"]        = 4
                 s["trade_state"]      = "LTF OB Identified — Waiting for Entry"
                 print(f"    📦 LTF OB alcista: {s['ltf_ob_low']:.2f} — {s['ltf_ob_high']:.2f}")
+                send_telegram(f"📦 <b>OB LTF identificado</b> — {symbol}\nZona: {s['ltf_ob_low']:.2f} — {s['ltf_ob_high']:.2f}\n⏳ Esperando entrada...")
 
         if bos_dir == -1:
-            # Vela alcista seguida de bajista → bearish OB
             if closes[-1] > opens[-1]:
                 s["ltf_ob_high"] = highs[-1]
                 s["ltf_ob_low"]  = lows[-1]
@@ -468,13 +427,13 @@ def process_ltf(symbol, ltf_interval="5m", swing_len=3, fifty_tolerance=5.0):
                 s["ltf_state"]        = 4
                 s["trade_state"]      = "LTF OB Identified — Waiting for Entry"
                 print(f"    📦 LTF OB bajista: {s['ltf_ob_low']:.2f} — {s['ltf_ob_high']:.2f}")
+                send_telegram(f"📦 <b>OB LTF identificado</b> — {symbol}\nZona: {s['ltf_ob_low']:.2f} — {s['ltf_ob_high']:.2f}\n⏳ Esperando entrada...")
 
-    # Estado 4 → esperar que precio entre al OB → ENTRADA
     if s["ltf_state"] == 4 and not s["ltf_trade_active"]:
         if s["ltf_ob_high"] is None or s["ltf_ob_low"] is None:
             return None
 
-        ob_buffer = 0.001  # 0.1% buffer igual que el Pine
+        ob_buffer = 0.001
 
         if bos_dir == 1 and lows[-1] <= s["ltf_ob_high"] and highs[-1] >= s["ltf_ob_low"]:
             entry = closes[-1]
@@ -504,27 +463,41 @@ def process_ltf(symbol, ltf_interval="5m", swing_len=3, fifty_tolerance=5.0):
             print(f"    🔴 SEÑAL SHORT | Entry: {entry:.2f} | SL: {sl:.2f} | TP: {tp:.2f}")
             return {"side": "SELL", "entry": entry, "sl": round(sl, 2), "tp": round(tp, 2)}
 
-    # Estado 5 → trade activo: monitorear SL/TP
     if s["ltf_state"] == 5 and s["ltf_trade_active"]:
         bos_dir = s["htf_bos_dir"]
+        side    = "BUY" if bos_dir == 1 else "SELL"
+
         if bos_dir == 1:
             if lows[-1] <= s["ltf_stop_loss"]:
-                print(f"    ❌ SL alcanzado — re-entry disponible")
+                print(f"    ❌ SL alcanzado")
+                log_trade_exit(symbol, side, s["ltf_entry_price"], lows[-1],
+                               s["ltf_quantity"] or 0.001, s["ltf_balance"] or 0, "STOP LOSS")
+                send_telegram(f"❌ <b>STOP LOSS</b> — {symbol}\nEntry: {s['ltf_entry_price']:.2f}\nSL: {lows[-1]:.2f}")
                 _reset_ltf_state(s)
-                s["ltf_state"]  = 1  # Volver a buscar en LTF
+                s["ltf_state"] = 1
             elif highs[-1] >= s["ltf_take_profit"]:
                 print(f"    ✅ TP alcanzado")
+                log_trade_exit(symbol, side, s["ltf_entry_price"], highs[-1],
+                               s["ltf_quantity"] or 0.001, s["ltf_balance"] or 0, "TAKE PROFIT")
+                send_telegram(f"✅ <b>TAKE PROFIT</b> — {symbol}\nEntry: {s['ltf_entry_price']:.2f}\nTP: {highs[-1]:.2f}")
                 _reset_ltf_state(s)
-                s["ltf_state"]  = 1
+                s["ltf_state"] = 1
+
         if bos_dir == -1:
             if highs[-1] >= s["ltf_stop_loss"]:
-                print(f"    ❌ SL alcanzado — re-entry disponible")
+                print(f"    ❌ SL alcanzado")
+                log_trade_exit(symbol, side, s["ltf_entry_price"], highs[-1],
+                               s["ltf_quantity"] or 0.001, s["ltf_balance"] or 0, "STOP LOSS")
+                send_telegram(f"❌ <b>STOP LOSS</b> — {symbol}\nEntry: {s['ltf_entry_price']:.2f}\nSL: {highs[-1]:.2f}")
                 _reset_ltf_state(s)
-                s["ltf_state"]  = 1
+                s["ltf_state"] = 1
             elif lows[-1] <= s["ltf_take_profit"]:
                 print(f"    ✅ TP alcanzado")
+                log_trade_exit(symbol, side, s["ltf_entry_price"], lows[-1],
+                               s["ltf_quantity"] or 0.001, s["ltf_balance"] or 0, "TAKE PROFIT")
+                send_telegram(f"✅ <b>TAKE PROFIT</b> — {symbol}\nEntry: {s['ltf_entry_price']:.2f}\nTP: {lows[-1]:.2f}")
                 _reset_ltf_state(s)
-                s["ltf_state"]  = 1
+                s["ltf_state"] = 1
 
     return None
 
@@ -595,6 +568,23 @@ def execute_trade(symbol, side, sl_price, tp_price):
 
     print(f"✅ {side} {quantity} {symbol} | Balance: {balance:.2f} | SL: {sl_price} | TP: {tp_price}")
 
+    # Guardar quantity y balance en el estado para el log de salida
+    s = get_state(symbol)
+    s["ltf_quantity"] = quantity
+    s["ltf_balance"]  = balance
+
+    # Registrar entrada en Google Sheets
+    log_trade_entry(symbol, side, entry_price, sl_price, tp_price, quantity, balance)
+
+    # Notificar por Telegram
+    send_telegram(
+        f"{'🟢' if side == 'BUY' else '🔴'} <b>{'LONG' if side == 'BUY' else 'SHORT'} EJECUTADO</b> — {symbol}\n"
+        f"Entry: {entry_price:.2f}\n"
+        f"SL: {sl_price:.2f}\n"
+        f"TP: {tp_price:.2f}\n"
+        f"Qty: {quantity} | Balance: {balance:.2f} USDT"
+    )
+
     return {
         "status"      : "ok",
         "order_id"    : order["orderId"],
@@ -614,14 +604,13 @@ def index():
 
 @app.route("/status", methods=["GET"])
 def status():
-    """Muestra el estado actual de cada símbolo"""
     return jsonify({
         sym: {
-            "trade_state"      : s["trade_state"],
-            "htf_bos_dir"      : s["htf_bos_dir"],
+            "trade_state"       : s["trade_state"],
+            "htf_bos_dir"       : s["htf_bos_dir"],
             "htf_channel_active": s["htf_channel_active"],
-            "ltf_state"        : s["ltf_state"],
-            "ltf_trade_active" : s["ltf_trade_active"],
+            "ltf_state"         : s["ltf_state"],
+            "ltf_trade_active"  : s["ltf_trade_active"],
         }
         for sym, s in state.items()
     }), 200
@@ -691,16 +680,11 @@ def run_engine(symbols=["BTCUSDT", "ETHUSDT"], interval_seconds=300):
         for symbol in symbols:
             try:
                 print(f"\n📊 [{symbol}] Estado: {get_state(symbol)['trade_state']}")
-
-                # Procesar HTF primero
                 process_htf(symbol, htf_interval="1h", swing_len=5)
-
-                # Procesar LTF solo si el canal está activo
                 signal = process_ltf(symbol, ltf_interval="5m", swing_len=3, fifty_tolerance=5.0)
-
                 if signal:
                     send_signal(symbol, signal)
-
+                update_bot_state(symbol, get_state(symbol)["trade_state"])
             except Exception as e:
                 print(f"  ❌ Error en {symbol}: {e}")
 
@@ -709,6 +693,8 @@ def run_engine(symbols=["BTCUSDT", "ETHUSDT"], interval_seconds=300):
 # ─── Arranque ──────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    setup_headers()
+
     engine_thread = threading.Thread(target=run_engine, daemon=True)
     engine_thread.start()
 
