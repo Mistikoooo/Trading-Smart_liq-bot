@@ -12,7 +12,13 @@ SCOPES = [
 SHEET_ID = os.environ.get("GOOGLE_SHEET_ID")
 
 def get_client():
-    creds_json = os.environ.get("GOOGLE_CREDENTIALS")
+    import base64
+    creds_raw = os.environ.get("GOOGLE_CREDENTIALS")
+    # Intentar base64 primero, sino usar JSON directo
+    try:
+        creds_json = base64.b64decode(creds_raw).decode("utf-8")
+    except Exception:
+        creds_json = creds_raw
     creds_dict = json.loads(creds_json)
     creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
     return gspread.authorize(creds)
