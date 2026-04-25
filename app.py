@@ -675,8 +675,25 @@ def send_signal(symbol, signal):
         print(f"❌ Error enviando señal: {e}")
 
 def run_engine(symbols=["BTCUSDT", "ETHUSDT"], interval_seconds=300):
-    print(f"🚀 Motor iniciado — chequeando cada {interval_seconds}s")
+    print(f"🚀 Motor iniciado — sincronizando con velas de 5 minutos...")
+
     while True:
+        # Sincronizar con el próximo cierre de vela de 5 minutos
+        now        = time.time()
+        seconds    = interval_seconds
+        wait_time  = seconds - (now % seconds)
+
+        if wait_time < 5:
+            # Si faltan menos de 5 segundos, esperamos al siguiente
+            wait_time += seconds
+
+        next_candle = time.strftime("%H:%M:%S", time.localtime(now + wait_time))
+        print(f"⏳ Esperando próxima vela en {wait_time:.0f}s (cierra a las {next_candle})")
+        time.sleep(wait_time)
+
+        # Esperar 2 segundos extra para asegurarnos que la vela cerró
+        time.sleep(2)
+
         for symbol in symbols:
             try:
                 print(f"\n📊 [{symbol}] Estado: {get_state(symbol)['trade_state']}")
@@ -687,8 +704,6 @@ def run_engine(symbols=["BTCUSDT", "ETHUSDT"], interval_seconds=300):
                 update_bot_state(symbol, get_state(symbol)["trade_state"])
             except Exception as e:
                 print(f"  ❌ Error en {symbol}: {e}")
-
-        time.sleep(interval_seconds)
 
 # ─── Arranque ──────────────────────────────────────────────────────────────────
 
