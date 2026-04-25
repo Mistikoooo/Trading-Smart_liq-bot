@@ -937,7 +937,7 @@ def send_signal(symbol, signal):
     except Exception as e:
         print(f"❌ Error enviando señal: {e}")
 
-def run_engine(symbols=["BTCUSDT", "ETHUSDT"], interval_seconds=300):
+def run_engine(symbols=["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "AAVEUSDT", "HYPEUSDT"], interval_seconds=300):
     print(f"🚀 Motor iniciado — sincronizando con velas de 5 minutos...")
 
     while True:
