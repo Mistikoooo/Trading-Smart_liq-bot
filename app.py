@@ -700,3 +700,12 @@ if __name__ == "__main__":
 
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
+@app.route("/debug-creds", methods=["GET"])
+def debug_creds():
+    creds = os.environ.get("GOOGLE_CREDENTIALS", "NO EXISTE")
+    return jsonify({
+        "length": len(creds),
+        "first_10": creds[:10],
+        "last_10": creds[-10:]
+    }), 200
